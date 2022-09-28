@@ -1481,6 +1481,21 @@ class Layout(IRNode):
                 return False
         return True
 
+    def is_channels_last_stride_ordered(self):
+        order = [0] + list(reversed(range(1, len(self.stride) - 1)))
+        if len(order) < len(self.stride):
+            # add batch dim if it exists
+            order = [len(order)] + order
+        # reorder the stride given order
+        stride_ordered = [None] * len(order)
+        for i in range(len(order)):
+            stride_ordered[order[i]] = V.graph.sizevars.size_hint(self.stride[i])
+        # check if it is in ascending order
+        for i in range(len(order) - 1):
+            if stride_ordered[i] > stride_ordered[i + 1]:
+                return False
+        return True
+
     def as_fixed(self):
         return FixedLayout(
             self.device,
@@ -2840,6 +2855,252 @@ class MultiOutput(ExternKernel):
     def should_allocate(self):
         return False
 
+class LinearReLU(ExternKernelAlloc):
+    kernel = "torch.ops.mkldnn_prepacked.linear_eltwise"
+
+    def __init__(
+        self,
+        layout,
+        inputs,
+        constant_args=(),
+        kernel="torch.ops.mkldnn_prepacked.linear_eltwise",
+    ):
+        super().__init__(layout, inputs, constant_args)
+        self.kernel = kernel
+
+    def codegen(self, wrapper):
+        wrapper.writeline(
+            f"{self.get_name()} = {self.kernel}({', '.join(self.codegen_args())})"
+        )
+    
+    @classmethod
+    def create(cls, x, w, b, attr, scalars, algorithm):
+        kernel = "torch.ops.mkldnn_prepacked.linear_eltwise"
+        *m, k1 = x.get_size()
+        k2, n = w.get_size()
+
+        inputs = [x, w]
+        constant_args = [attr, scalars, algorithm]
+        if b is not None:
+            inputs.append(b)
+        else:
+            constant_args.insert(0, b)
+
+        return LinearReLU(
+            layout=FlexibleLayout(
+                device=x.get_device(),
+                dtype=x.get_dtype(),
+                size=list(m) + [n],
+            ),
+            inputs=inputs,
+            constant_args=constant_args,
+            kernel=kernel,)
+    
+    def apply_constraint(self):
+        pass
+
+class ConvEltwise(ExternKernelAlloc):
+    kernel = "torch.ops.mkldnn_fusion.mkldnn_convolution_elementwise"
+
+    def __init__(
+        self,
+        layout,
+        inputs,
+        constant_args=(),
+        kernel="torch.ops.mkldnn_fusion.mkldnn_convolution_elementwise",
+    ):
+        super().__init__(layout, inputs, constant_args)
+        self.kernel = kernel
+
+    def codegen(self, wrapper):
+        wrapper.writeline(
+            f"{self.get_name()} = {self.kernel}({', '.join(self.codegen_args())})"
+        )
+
+    @classmethod
+    def create(
+        cls,
+        x: "TensorBox",
+        w: "TensorBox",
+        b: "TensorBox",
+        padding_: List[int],
+        stride_: List[int],
+        dilation_: List[int],
+        groups: int,
+        attr,
+        scalars,
+        algorithm):
+        kernel = "torch.ops.mkldnn_fusion.mkldnn_convolution_elementwise"
+        x = cls.require_stride1(cls.realize_input(x))
+        w = cls.require_stride1(cls.realize_input(w))
+
+        inputs = [x, w]
+        stride = tuple(stride_)
+        padding = tuple(padding_)
+        dilation = tuple(dilation_)
+        assert isinstance(groups, int)
+
+        weight_shape = [
+            sympy.Integer(V.graph.sizevars.guard_static_shape(s))
+            for s in w.get_size()
+        ]
+
+        out_channels, in_channels1, *kernel_size = weight_shape
+        in_channels1 = in_channels1 * groups
+        assert len(x.get_size()) == 2 + len(kernel_size)
+        batch, in_channels2, *input_size = x.get_size()
+        output_size = [batch]
+        V.graph.sizevars.guard_equals(in_channels1, in_channels2)
+
+        output_size.append(out_channels)
+        assert (
+            len(stride)
+            == len(padding)
+            == len(dilation)
+            == len(kernel_size)
+            == len(input_size)
+        )
+        for i in range(len(stride)):
+            output_size.append(
+                IndexingDiv(
+                    input_size[i]
+                    + 2 * padding[i]
+                    - dilation[i] * (kernel_size[i] - 1)
+                    - 1
+                    + stride[i],
+                    stride[i],
+                    )
+            )
+            output_size[-1] = sympy.Integer(
+                V.graph.sizevars.guard_static_shape(output_size[-1])
+            )
+ 
+        if x.get_layout().is_channels_last_stride_ordered() or \
+            w.get_layout().is_channels_last_stride_ordered():
+            output_layout_str = "torch.channels_last"
+        else:
+            output_layout_str = "torch.contiguous_format"
+        output_layout_str = "torch.contiguous_format"
+        if output_layout_str == "torch.channels_last":
+            stride_order = [0] + list(reversed(range(1, len(kernel_size) + 1)))
+            if len(stride_order) < len(output_size):
+                # add batch dim if it exists
+                stride_order = [len(stride_order)] + stride_order
+        else:
+            stride_order = list(reversed(range(len(output_size))))
+
+        constant_args = [padding, stride, dilation, groups, attr, scalars, algorithm]
+
+        if b is not None:
+            inputs.append(b)
+        else:
+            constant_args.insert(0, b)
+        return ConvEltwise(
+            layout=FlexibleLayout(
+                device=x.get_device(),
+                dtype=x.get_dtype(),
+                size=output_size,
+            ),
+            inputs=inputs,
+            constant_args=constant_args,
+            kernel=kernel,)
+    
+    def apply_constraint(self):
+        pass
+
+class ConvBinary(ExternKernelAlloc):
+    kernel = "torch.ops.mkldnn_fusion.mkldnn_convolution_binary"
+
+    def __init__(
+        self,
+        layout,
+        inputs,
+        constant_args=(),
+        kernel="torch.ops.mkldnn_fusion.mkldnn_convolution_binary",
+    ):
+        super().__init__(layout, inputs, constant_args)
+        self.kernel = kernel
+
+    def codegen(self, wrapper):
+        wrapper.writeline(
+            f"{self.get_name()} = {self.kernel}({', '.join(self.codegen_args())})"
+        )
+
+    @classmethod
+    def create(
+        cls,
+        x: "TensorBox",
+        other: "TensorBox",
+        w: "TensorBox",
+        b: "TensorBox",
+        padding_: List[int],
+        stride_: List[int],
+        dilation_: List[int],
+        groups: int,
+        attr:str):
+        kernel = "torch.ops.mkldnn_fusion.mkldnn_convolution_binary"
+        x = cls.require_stride1(cls.realize_input(x))
+        other = cls.require_stride1(cls.realize_input(other))
+        w = cls.require_stride1(cls.realize_input(w))
+
+        inputs = [x, other, w]
+        stride = tuple(stride_)
+        padding = tuple(padding_)
+        dilation = tuple(dilation_)
+        assert isinstance(groups, int)
+
+        weight_shape = [
+            sympy.Integer(V.graph.sizevars.guard_static_shape(s))
+            for s in w.get_size()
+        ]
+
+        out_channels, in_channels1, *kernel_size = weight_shape
+        in_channels1 = in_channels1 * groups
+        assert len(x.get_size()) == 2 + len(kernel_size)
+        batch, in_channels2, *input_size = x.get_size()
+        output_size = [batch]
+        V.graph.sizevars.guard_equals(in_channels1, in_channels2)
+        assert (
+            len(stride)
+            == len(padding)
+            == len(dilation)
+            == len(kernel_size)
+            == len(input_size)
+        )
+        output_size = other.get_size()
+        if x.get_layout().is_channels_last_stride_ordered() or \
+            w.get_layout().is_channels_last_stride_ordered():
+            output_layout_str = "torch.channels_last"
+        else:
+            output_layout_str = "torch.contiguous_format"
+        output_layout_str = "torch.contiguous_format"
+        if output_layout_str == "torch.channels_last":
+            stride_order = [0] + list(reversed(range(1, len(kernel_size) + 1)))
+            if len(stride_order) < len(output_size):
+                # add batch dim if it exists
+                stride_order = [len(stride_order)] + stride_order
+        else:
+            stride_order = list(reversed(range(len(output_size))))
+
+        constant_args = [padding, stride, dilation, groups, attr]
+
+        if b is not None:
+            inputs.append(b)
+        else:
+            constant_args.insert(0, b)
+        return ConvEltwise(
+            layout=FlexibleLayout(
+                device=x.get_device(),
+                dtype=x.get_dtype(),
+                size=output_size,
+                stride_order=stride_order,
+            ),
+            inputs=inputs,
+            constant_args=constant_args,
+            kernel=kernel,)
+    
+    def apply_constraint(self):
+        pass
 
 class Convolution(ExternKernelAlloc):
     kernel = "aten.convolution"
@@ -3007,8 +3268,12 @@ class Convolution(ExternKernelAlloc):
                 x.get_dtype(),
             )
         else:
-            output_layout_str = "torch.contiguous_format"
-
+            if x.get_layout().is_channels_last_stride_ordered() or \
+                weight.get_layout().is_channels_last_stride_ordered():
+                output_layout_str = "torch.channels_last"
+            else:
+                output_layout_str = "torch.contiguous_format"
+        output_layout_str = "torch.channels_last"
         if output_layout_str == "torch.channels_last":
             stride_order = [0] + list(reversed(range(1, len(kernel_size) + 1)))
             if len(stride_order) < len(output_size):

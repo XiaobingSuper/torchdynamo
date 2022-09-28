@@ -5,6 +5,7 @@ from typing import List
 
 import functorch
 import torch.fx
+from torch.fx.passes.shape_prop import ShapeProp
 from functorch.compile import make_boxed_compiler
 from functorch.compile import min_cut_rematerialization_partition
 from torch._subclasses.fake_tensor import FakeTensor
@@ -12,6 +13,7 @@ from torch.utils._mode_utils import no_dispatch
 
 from torchdynamo.optimizations.backends import aot_autograd
 from torchdynamo.optimizations.normalize import normalize_ir
+from torchdynamo.optimizations.fuse_post_op import fuse_post_op
 from torchdynamo.utils import dynamo_timed
 from torchdynamo.utils import identity
 from torchdynamo.utils import preserve_rng_state
@@ -237,6 +239,8 @@ def compile_fx(model_: torch.fx.GraphModule, example_inputs_: List[torch.Tensor]
     with overrides.patch_functions():
         model_ = normalize_ir(model_, example_inputs_)
         model_ = overrides.replace_fx(model_)
+        ShapeProp(model_).propagate(*example_inputs_)
+        model_ = fuse_post_op(model_, example_inputs_)
     num_example_inputs = len(example_inputs_)
     cudagraphs = BoxedBool(config.triton.cudagraphs)
 

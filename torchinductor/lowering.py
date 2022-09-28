@@ -754,6 +754,18 @@ def bmm(a: TensorBox, b: TensorBox):
     return TensorBox.create(ir.BatchMatrixMultiply.create(a, b))
 
 
+@register_lowering(torch.ops.mkldnn_prepacked.linear_eltwise)
+def linear_eltwise(x: TensorBox, w: TensorBox, b: TensorBox, attr, scalars, algorithm):
+    return TensorBox.create(ir.LinearReLU.create(x, w, b, attr, scalars, algorithm))
+
+@register_lowering(torch.ops.mkldnn_fusion.mkldnn_convolution_elementwise)
+def conv_eltwise(x: TensorBox, w: TensorBox, b: TensorBox, stride, padding, dilation, groups, attr, scalars, algorithm):
+    return TensorBox.create(ir.ConvEltwise.create(x, w, b, stride, padding, dilation, groups, attr, scalars, algorithm))
+
+@register_lowering(torch.ops.mkldnn_fusion.mkldnn_convolution_binary)
+def conv_binary(x: TensorBox, other: TensorBox, w: TensorBox, b: TensorBox, stride, padding, dilation, groups, attr):
+    return TensorBox.create(ir.ConvBinary.create(x, other, w, b, stride, padding, dilation, groups, attr))
+
 def fallback_handler(kernel):
     fallbacks.add(kernel)
 
